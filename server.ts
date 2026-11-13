@@ -1240,6 +1240,10 @@ async function startServer() {
       process.env.npm_lifecycle_event !== 'start' &&
       !fs.existsSync(path.join(DIST_DIR, 'index.html')));
 
+  app.get(['/admin', '/admin/*'], (_req, res) => {
+    res.redirect('/#admin');
+  });
+
   if (isDev) {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({

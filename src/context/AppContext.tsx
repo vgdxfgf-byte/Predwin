@@ -12,6 +12,7 @@ import {
   PaymentGatewayConfig,
   WhatsAppSupportConfig
 } from '../types';
+import { handleStaticApiRequest } from '../utils/staticFallback';
 
 const DEFAULT_PAYMENT_GATEWAY: PaymentGatewayConfig = {
   title: 'Official Admin Payment Gateway',
@@ -114,6 +115,30 @@ const STORAGE_KEYS = {
   PORTAL: 'apex_active_portal_v2'
 };
 
+function safeGetStorage(key: string): string | null {
+  try {
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function safeSetStorage(key: string, value: string) {
+  try {
+    window.localStorage.setItem(key, value);
+  } catch {
+    // Ignore storage access errors
+  }
+}
+
+function safeRemoveStorage(key: string) {
+  try {
+    window.localStorage.removeItem(key);
+  } catch {
+    // Ignore storage access errors
+  }
+}
+
 interface UserStatePayload {
   user: User;
   predictions: Prediction[];
@@ -143,17 +168,22 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     if (typeof window !== 'undefined') {
       const path = window.location.pathname.toLowerCase();
       const hash = window.location.hash.toLowerCase();
-      if (path === '/admin' || path.startsWith('/admin/') || hash === '#admin') {
+      const params = new URLSearchParams(window.location.search);
+      const roleParam = (params.get('role') || params.get('portal') || '').toLowerCase();
+      if (path === '/admin' || path.startsWith('/admin/') || hash === '#admin' || roleParam === 'admin') {
         return 'admin';
       }
     }
-    const saved = localStorage.getItem(STORAGE_KEYS.PORTAL);
+    const saved = safeGetStorage(STORAGE_KEYS.PORTAL);
     return saved === 'admin' ? 'admin' : 'user';
   });
 
-  const [userToken, setUserToken] = useState<string | null>(() => localStorage.getItem(STORAGE_KEYS.USER_TOKEN));
-  const [adminToken, setAdminToken] = useState<string | null>(() => localStorage.getItem(STORAGE_KEYS.ADMIN_TOKEN));
+  const [userToken, setUserToken] = useState<string | null>(() => safeGetStorage(STORAGE_KEYS.USER_TOKEN));
+  const [adminToken, setAdminToken] = useState<string | null>(() => safeGetStorage(STORAGE_KEYS.ADMIN_TOKEN));
   const [isHydrating, setIsHydrating] = useState<boolean>(true);
+  const staticModeRef = useRef<boolean>(
+    typeof window !== 'undefined' && window.location.hostname.endsWith('.github.io')
+  );
 
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [adminUser, setAdminUser] = useState<User | null>(null);
@@ -171,13 +201,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const setActivePortal = useCallback((portal: 'user' | 'admin') => {
     setActivePortalState(portal);
-    localStorage.setItem(STORAGE_KEYS.PORTAL, portal);
+    safeSetStorage(STORAGE_KEYS.PORTAL, portal);
     if (typeof window !== 'undefined') {
       const url = new URL(window.location.href);
       if (portal === 'admin') {
         url.hash = 'admin';
-      } else if (url.hash === '#admin') {
-        url.hash = '';
+      } else {
+        if (url.hash === '#admin') url.hash = '';
+        if (url.searchParams.get('role') === 'admin') url.searchParams.delete('role');
       }
       window.history.replaceState({}, '', url.toString());
     }
@@ -235,6 +266,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       options: RequestInit = {},
       token?: string | null
     ): Promise<{ ok: boolean; status: number; data: T & { success?: boolean; error?: string } }> => {
+      if (staticModeRef.current) {
+        return handleStaticApiRequest(url, options, token) as {
+          ok: boolean;
+          status: number;
+          data: T & { success?: boolean; error?: string };
+        };
+      }
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
         ...(options.headers as Record<string, string> | undefined)
@@ -243,6 +281,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         headers.Authorization = `Bearer ${token}`;
       }
       const res = await fetch(url, { ...options, headers, cache: 'no-store' });
+      const contentType = res.headers.get('content-type') || '';
+      if (res.status === 404 && !contentType.includes('application/json')) {
+        staticModeRef.current = true;
+        return handleStaticApiRequest(url, options, token) as {
+          ok: boolean;
+          status: number;
+          data: T & { success?: boolean; error?: string };
+        };
+      }
       let data = {} as T & { success?: boolean; error?: string };
       try {
         data = (await res.json()) as T & { success?: boolean; error?: string };
@@ -268,7 +315,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           if (res.status === 401 || res.status === 403) {
             setAdminToken(null);
             setAdminUser(null);
-            localStorage.removeItem(STORAGE_KEYS.ADMIN_TOKEN);
+            safeRemoveStorage(STORAGE_KEYS.ADMIN_TOKEN);
           }
         }
         const pub = await apiCall<{ predictions?: Prediction[]; whatsappSupport?: WhatsAppSupportConfig }>('/api/public', { method: 'GET' });
@@ -293,7 +340,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           if (res.status === 401 || res.status === 403) {
             setUserToken(null);
             setCurrentUser(null);
-            localStorage.removeItem(STORAGE_KEYS.USER_TOKEN);
+            safeRemoveStorage(STORAGE_KEYS.USER_TOKEN);
           }
         }
         const pub = await apiCall<{ predictions?: Prediction[]; whatsappSupport?: WhatsAppSupportConfig }>('/api/public', { method: 'GET' });
@@ -370,7 +417,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (!res.ok || !res.data.success || !res.data.token || !res.data.state) {
         return { success: false, error: res.data.error || 'Invalid credentials' };
       }
-      localStorage.setItem(STORAGE_KEYS.USER_TOKEN, res.data.token);
+      safeSetStorage(STORAGE_KEYS.USER_TOKEN, res.data.token);
       setUserToken(res.data.token);
       applyUserState(res.data.state);
       setActivePortal('user');
@@ -389,7 +436,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (!res.ok || !res.data.success || !res.data.token || !res.data.state) {
         return { success: false, error: res.data.error || 'Invalid administrator credentials' };
       }
-      localStorage.setItem(STORAGE_KEYS.ADMIN_TOKEN, res.data.token);
+      safeSetStorage(STORAGE_KEYS.ADMIN_TOKEN, res.data.token);
       setAdminToken(res.data.token);
       applyAdminState(res.data.state);
       setActivePortal('admin');
@@ -401,13 +448,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const logout = () => {
     if (activePortal === 'admin') {
-      localStorage.removeItem(STORAGE_KEYS.ADMIN_TOKEN);
+      safeRemoveStorage(STORAGE_KEYS.ADMIN_TOKEN);
       setAdminToken(null);
       setAdminUser(null);
       setUsers([]);
       setCoinLogs([]);
     } else {
-      localStorage.removeItem(STORAGE_KEYS.USER_TOKEN);
+      safeRemoveStorage(STORAGE_KEYS.USER_TOKEN);
       setUserToken(null);
       setCurrentUser(null);
       setBets([]);
